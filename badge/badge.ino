@@ -12,16 +12,24 @@
 #define TFT_DC 16
 #define TFT_MOSI 33  // SDA
 #define TFT_SCLK 35  // SCL
+#define BUTTON_PIN 0
 
 SPIClass displaySPI(FSPI);
 
 Adafruit_ST7789 tft = Adafruit_ST7789(&displaySPI, TFT_CS, TFT_DC, TFT_RST);
+
 static const int16_t W = 240;
 static const int16_t H = 320;
 
 static const uint8_t SCREEN_SECONDS = 15;
+static const uint32_t SCREEN_MS = (uint32_t)SCREEN_SECONDS * 1000UL;
 
-static const uint32_t TFT_SPI_SPEED = 8000000;  // 16000000
+static const uint32_t TFT_SPI_SPEED = 16000000;
+
+static const uint16_t BUTTON_DEBOUNCE_MS = 35;
+static const uint16_t BUTTON_LONG_PRESS_MS = 800;
+static const uint8_t BUTTON_POLL_MS = 5;
+static const uint16_t MODE_TOAST_MS = 3000;
 
 uint8_t qrTemp[qrcodegen_BUFFER_LEN_MAX];
 uint8_t qrData[qrcodegen_BUFFER_LEN_MAX];
@@ -33,20 +41,46 @@ enum ScreenId : uint8_t {
   SCREEN_COUNT
 };
 
+enum SwitchMode : uint8_t {
+  MODE_AUTO = 0,
+  MODE_MANUAL = 1
+};
+
 ScreenId screen = SCR_INTRO;
+SwitchMode switchMode = MODE_AUTO;
 
 const char *NAME = "MAKSYM";
 const char *SURNAME = "MYKHASYUTA";
 const char *TITLE = "Software Engineer";
 const char *QR_URL = "https://maxmyk.ca/contacts";
 
+static uint32_t nextAutoSwitchMs = 0;
+
+static bool toastVisible = false;
+static uint32_t toastUntilMs = 0;
+
+static bool buttonLastRawPressed = false;
+static bool buttonStablePressed = false;
+static bool buttonLongHandled = false;
+static uint32_t buttonLastChangeMs = 0;
+static uint32_t buttonPressStartMs = 0;
+static uint32_t buttonLastPollMs = 0;
+
 static void setupPowerSaving();
-static void waitBetweenScreens();
+static void setupButton();
 
 static void initDisplayBus();
 static void hardResetDisplay();
 static void reinitDisplay();
 static void beginScreen();
+
+static void updateButton(uint32_t nowMs);
+static void handleShortPress();
+static void handleLongPress();
+static void handleToast(uint32_t nowMs);
+static void advanceScreen();
+static void scheduleNextAutoSwitch();
+static bool timeReached(uint32_t nowMs, uint32_t targetMs);
 
 static void switchScreen(ScreenId next);
 
@@ -55,6 +89,7 @@ static void drawAboutScreen();
 static void drawQRScreen();
 
 static void drawFlag();
+static void drawModeToast();
 static void drawCenteredText(const char *text, int16_t y, uint8_t size,
                              uint16_t color);
 static void drawRGB565_P_scaled(int16_t x, int16_t y, const uint16_t *src,
@@ -73,8 +108,17 @@ static void setupPowerSaving() {
 #endif
 }
 
-static void waitBetweenScreens() {
-  delay((uint32_t)SCREEN_SECONDS * 1000UL);
+static void setupButton() {
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  bool rawPressed = (digitalRead(BUTTON_PIN) == LOW);
+  buttonLastRawPressed = rawPressed;
+  buttonStablePressed = rawPressed;
+  buttonLastChangeMs = millis();
+
+  if (buttonStablePressed) {
+    buttonPressStartMs = millis();
+  }
 }
 
 static void initDisplayBus() {
@@ -112,6 +156,97 @@ static void beginScreen() {
   reinitDisplay();
 
   tft.fillScreen(ST77XX_BLACK);
+}
+
+static bool timeReached(uint32_t nowMs, uint32_t targetMs) {
+  return (int32_t)(nowMs - targetMs) >= 0;
+}
+
+static void scheduleNextAutoSwitch() {
+  nextAutoSwitchMs = millis() + SCREEN_MS;
+}
+
+static void updateButton(uint32_t nowMs) {
+  if ((uint32_t)(nowMs - buttonLastPollMs) < BUTTON_POLL_MS) {
+    return;
+  }
+
+  buttonLastPollMs = nowMs;
+
+  bool rawPressed = (digitalRead(BUTTON_PIN) == LOW);
+
+  if (rawPressed != buttonLastRawPressed) {
+    buttonLastRawPressed = rawPressed;
+    buttonLastChangeMs = nowMs;
+  }
+
+  if ((uint32_t)(nowMs - buttonLastChangeMs) < BUTTON_DEBOUNCE_MS) {
+    return;
+  }
+
+  if (rawPressed != buttonStablePressed) {
+    buttonStablePressed = rawPressed;
+
+    if (buttonStablePressed) {
+      buttonPressStartMs = nowMs;
+      buttonLongHandled = false;
+    } else {
+      if (!buttonLongHandled) {
+        handleShortPress();
+      }
+    }
+  }
+
+  if (buttonStablePressed && !buttonLongHandled && (uint32_t)(nowMs - buttonPressStartMs) >= BUTTON_LONG_PRESS_MS) {
+    buttonLongHandled = true;
+    handleLongPress();
+  }
+}
+
+static void handleShortPress() {
+  toastVisible = false;
+  advanceScreen();
+
+  if (switchMode == MODE_AUTO) {
+    scheduleNextAutoSwitch();
+  }
+}
+
+static void handleLongPress() {
+  if (switchMode == MODE_AUTO) {
+    switchMode = MODE_MANUAL;
+  } else {
+    switchMode = MODE_AUTO;
+    scheduleNextAutoSwitch();
+  }
+
+  drawModeToast();
+
+  toastVisible = true;
+  toastUntilMs = millis() + MODE_TOAST_MS;
+}
+
+static void handleToast(uint32_t nowMs) {
+  if (!toastVisible) {
+    return;
+  }
+
+  if (!timeReached(nowMs, toastUntilMs)) {
+    return;
+  }
+
+  toastVisible = false;
+
+  switchScreen(screen);
+
+  if (switchMode == MODE_AUTO) {
+    scheduleNextAutoSwitch();
+  }
+}
+
+static void advanceScreen() {
+  ScreenId next = (ScreenId)((screen + 1) % SCREEN_COUNT);
+  switchScreen(next);
 }
 
 static void drawCenteredText(const char *text, int16_t y, uint8_t size,
@@ -187,6 +322,24 @@ static void drawFlag() {
   drawRGB565_P(x, y, flag_img, flag_width, flag_height);
 }
 
+static void drawModeToast() {
+  const int16_t boxW = 190;
+  const int16_t boxH = 58;
+  const int16_t boxX = (W - boxW) / 2;
+  const int16_t boxY = 132;
+
+  tft.fillRoundRect(boxX, boxY, boxW, boxH, 8, ST77XX_BLACK);
+  tft.drawRoundRect(boxX, boxY, boxW, boxH, 8, ST77XX_WHITE);
+
+  drawCenteredText("MODE", boxY + 8, 2, ST77XX_CYAN);
+
+  if (switchMode == MODE_AUTO) {
+    drawCenteredText("AUTO", boxY + 32, 2, ST77XX_GREEN);
+  } else {
+    drawCenteredText("MANUAL", boxY + 32, 2, ST77XX_YELLOW);
+  }
+}
+
 static void drawQR(const char *text, int16_t x, int16_t y, int16_t sizePx) {
   bool ok = qrcodegen_encodeText(text, qrTemp, qrData, qrcodegen_Ecc_LOW,
                                  qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
@@ -238,10 +391,9 @@ static void drawAboutScreen() {
   drawCenteredText("About me ", 10, 3, ST77XX_WHITE);
   drawCenteredText(TITLE, 46, 2, ST77XX_GREEN);
 
-  tft.setTextColor(ST77XX_GREEN);
+  tft.setTextColor(ST77XX_YELLOW);
   tft.setTextSize(2);
   tft.setCursor(0, 70);
-  tft.setTextColor(ST77XX_YELLOW);
   tft.print("--------------------");
 
   tft.setTextColor(ST77XX_CYAN);
@@ -304,17 +456,26 @@ static void switchScreen(ScreenId next) {
 
 void setup() {
   setupPowerSaving();
+  setupButton();
 
   initDisplayBus();
 
   reinitDisplay();
 
   switchScreen(SCR_INTRO);
+  scheduleNextAutoSwitch();
 }
 
 void loop() {
-  waitBetweenScreens();
+  uint32_t nowMs = millis();
 
-  ScreenId next = (ScreenId)((screen + 1) % SCREEN_COUNT);
-  switchScreen(next);
+  updateButton(nowMs);
+  handleToast(nowMs);
+
+  if (switchMode == MODE_AUTO && !toastVisible && timeReached(nowMs, nextAutoSwitchMs)) {
+    advanceScreen();
+    scheduleNextAutoSwitch();
+  }
+
+  delay(BUTTON_POLL_MS);
 }
